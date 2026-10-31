@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 - 2026-10-31
 
 - Show a percentage and completed-file count for each extraction stage.
 - Show the current filename and MiB written, including while large RomFS files are copying.
