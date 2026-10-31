@@ -38,9 +38,18 @@ class FakeExtractor(Extractor):
         self.specs[name] = (metadata(title_id, kind, content_id, version), content_id)
         return path
 
-    def run(self, args, source, *, partition=False):
+    def run(self, args, source, *, partition=False, on_tick=None):
         self.check_cancelled()
         self.calls.append((args, source))
+        if '--fstree' in args:
+            if source.suffix == '.nsp':
+                _, content_id = self.specs[source.name]
+                return ('[PFS0/Tree]\n pfs:/\n' + ''.join(f'  {name}\n' for name in
+                        [f'{content_id}.nca', f'{content_id}.cnmt.nca', f'{content_id}.tik']))
+            dlc = any(blob[12] == 0x82 and source.name == f'{content_id}.nca'
+                      for blob, content_id in self.specs.values())
+            zero_name = 'synthetic.bin' if dlc else 'main'
+            return f'[ContentArchive/Tree]\n program:/\n  0/\n   {zero_name}\n  1/\n   synthetic.bin\n'
         target = Path(args[-1])
         target.mkdir(parents=True, exist_ok=True)
         if source.suffix == '.nsp':
@@ -71,7 +80,7 @@ class ExtractionTests(unittest.TestCase):
         self.assertTrue((runner.output / 'exefs/main').is_file())
         self.assertTrue((runner.output / 'romfs/synthetic.bin').is_file())
         self.assertTrue((runner.output / 'DLC/0000000000002001/romfs/synthetic.bin').is_file())
-        self.assertEqual(len([a for a, _ in runner.calls if '--basenca' in a]), 2)
+        self.assertEqual(len([a for a, _ in runner.calls if '--basenca' in a and '-x' in a]), 2)
         self.assertEqual(len(runner.tickets), 3)
         self.assertFalse(runner.work.exists())
 
@@ -80,7 +89,7 @@ class ExtractionTests(unittest.TestCase):
         inputs = [runner.add('base.nsp', 0x1000, 0x80), runner.add('new.nsp', 0x1800, 0x81, 5),
                   runner.add('old.nsp', 0x1800, 0x81, 1)]
         runner.extract(inputs)
-        used = [source.name for args, source in runner.calls if '--basenca' in args]
+        used = [source.name for args, source in runner.calls if '--basenca' in args and '-x' in args]
         self.assertEqual(used, [f'{2:032x}.nca'] * 2)
 
     def test_update_needs_base(self):
