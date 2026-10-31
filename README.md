@@ -43,6 +43,13 @@ The standard Python Windows installer includes Tkinter, which supplies the GUI.
 2. Add multiple NSPs with **Add NSP files**, or paste full paths, one per line. Quoted paths work.
 3. Choose a new or empty output directory and click **Extract**.
 
+The progress bar shows the percentage of files completed in the **current stage**, such as
+unpacking an NSP or extracting RomFS. It also shows the current filename and MiB written.
+Large files can keep the percentage steady while their MiB counter increases: this is file-count
+progress, not a byte percentage or a time estimate. Counting files and reading metadata use an
+activity indicator until a file total is available. The stage reaches 100% after NSTool succeeds
+and all expected output files are present.
+
 Supply the base NSP together with any update NSPs. The script reads CNMT metadata to identify
 base games, updates, and DLC, and chooses the highest version supplied for each title.
 All input tickets are passed to NSTool, including the base ticket when extracting an update.

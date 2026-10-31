@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import queue
 import re
 import shutil
@@ -73,18 +73,88 @@ def newest(titles: list[Title]) -> list[Title]:
     return list(selected.values())
 
 
+def tree_files(text: str, partition: int | None = None) -> list[Path]:
+    """Read NSTool's indented tree in its extraction order, optionally within /N."""
+    active = False
+    root_seen = False
+    directories: list[tuple[int, str]] = []
+    files = []
+    for line in text.splitlines():
+        if re.match(r'^\[[^]]+/Tree\]$', line):
+            active = True
+            continue
+        if not active:
+            continue
+        if line.startswith('['):
+            break
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(' '))
+        name = line.strip()
+        if not root_seen:
+            if not name.endswith(':/'):
+                raise ValueError('NSTool returned an unsupported filesystem tree.')
+            root_seen = True
+            continue
+        while directories and directories[-1][0] >= indent:
+            directories.pop()
+        if name.endswith('/'):
+            directories.append((indent, name[:-1]))
+            continue
+        parts = [directory for _, directory in directories] + [name]
+        if partition is not None:
+            if parts[0] != str(partition):
+                continue
+            parts = parts[1:]
+        if not parts or any(p in ('.', '..') or '/' in p or '\\' in p or ':' in p for p in parts):
+            raise ValueError('NSTool returned an unsafe or unsupported file path.')
+        relative = PurePosixPath(*parts)
+        files.append(Path(*relative.parts))
+    if not root_seen:
+        raise ValueError('NSTool did not return a readable filesystem tree.')
+    return files
+
+
+class FileProgress:
+    """NSTool writes sequentially: the next created file confirms the previous one."""
+    def __init__(self, destination: Path, files: list[Path], stage: str, report):
+        self.destination, self.files, self.stage, self.report = destination, files, stage, report
+        self.started = 0
+
+    def poll(self):
+        while self.started < len(self.files) and (self.destination / self.files[self.started]).is_file():
+            self.started += 1
+        current = self.files[max(0, self.started - 1)] if self.files else None
+        current_bytes = 0
+        if current is not None:
+            try:
+                current_bytes = (self.destination / current).stat().st_size
+            except FileNotFoundError:
+                pass
+        self.report({'stage': self.stage, 'completed': max(0, self.started - 1),
+                     'total': len(self.files), 'current': str(current) if current else '',
+                     'current_bytes': current_bytes})
+
+    def finish(self):
+        if not self.files or any(not (self.destination / path).is_file() for path in self.files):
+            raise RuntimeError(f'Incomplete extraction in {self.destination}. Expected files are missing.')
+        self.report({'stage': self.stage, 'completed': len(self.files), 'total': len(self.files),
+                     'current': '', 'current_bytes': 0})
+
+
 class Extractor:
-    def __init__(self, tool: Path, keys: Path, output: Path, log, cancelled: threading.Event):
+    def __init__(self, tool: Path, keys: Path, output: Path, log, cancelled: threading.Event, progress=None):
         self.tool, self.keys, self.output = tool, keys, output
         self.log, self.cancelled = log, cancelled
         self.tickets: list[Path] = []
         self.work: Path | None = None
+        self.progress = progress or (lambda event: None)
 
     def check_cancelled(self):
         if self.cancelled.is_set():
             raise RuntimeError('Cancelled. Partial output and working files were retained.')
 
-    def run(self, args: list[str | Path], source: Path, *, partition: bool = False):
+    def run(self, args: list[str | Path], source: Path, *, partition: bool = False, on_tick=None):
         self.check_cancelled()
         command = [str(self.tool), '-k', str(self.keys)]
         for ticket in self.tickets:
@@ -96,6 +166,13 @@ class Extractor:
             with subprocess.Popen(command, stdout=capture, stderr=subprocess.STDOUT,
                                   creationflags=flags) as process:
                 while process.poll() is None:
+                    if on_tick:
+                        try:
+                            on_tick()
+                        except Exception:
+                            process.terminate()
+                            process.wait()
+                            raise
                     if self.cancelled.wait(0.15):
                         process.terminate()
                         try:
@@ -115,14 +192,34 @@ class Extractor:
                           and not re.search(r'[0-9a-fA-F]{32,}', line)]
             detail = '\n'.join(safe_lines[-6:]) or 'Check keys, tickets, source files, and free disk space.'
             raise RuntimeError(f'NSTool failed on {source.name} (exit {process.returncode}).\n{detail}')
+        self.check_cancelled()
+        return text
+
+    def extract_files(self, source: Path, destination: Path, stage: str,
+                      base_args=None, number: int | None = None):
+        self.progress({'stage': f'Counting files: {stage}', 'total': None})
+        args = list(base_args or [])
+        listing = self.run([*args, '--fstree'], source, partition=number is not None)
+        files = tree_files(listing, number)
+        if not files:
+            raise RuntimeError(f'No extractable files found for {stage}.')
+        tracker = FileProgress(destination, files, stage, self.progress)
+        tracker.poll()
+        extract_args = [*args, '-x']
+        if number is not None:
+            extract_args.append(f'/{number}')
+        extract_args.append(destination)
+        self.run(extract_args, source, partition=number is not None, on_tick=tracker.poll)
+        self.check_cancelled()
+        tracker.finish()
 
     def dump_partition(self, content: Content, number: int, destination: Path, base: Content | None = None):
         destination.mkdir(parents=True, exist_ok=False)
         args: list[str | Path] = []
         if base:
             args += ['--basenca', base.path]
-        args += ['-x', f'/{number}', destination]
-        self.run(args, content.path, partition=True)
+        label = 'ExeFS' if destination.name == 'exefs' else 'RomFS'
+        self.extract_files(content.path, destination, f'{label} - {destination.parent.name}', args, number)
         if not any(p.is_file() for p in destination.rglob('*')):
             raise RuntimeError(f'No files extracted to {destination}. Check keys and selected content.')
 
@@ -143,7 +240,7 @@ class Extractor:
         for i, source in enumerate(inputs, 1):
             self.log(f'[{i}/{len(inputs)}] Unpacking {source.name}')
             folder = self.work / f'nsp-{i}'
-            self.run(['-x', folder], source)
+            self.extract_files(source, folder, f'NSP {i}/{len(inputs)} - {source.name}')
             folders.append(folder)
         self.tickets = [ticket for folder in folders for ticket in folder.rglob('*.tik')]
         ncas: dict[str, Path] = {}
@@ -159,6 +256,7 @@ class Extractor:
         titles = []
         for i, meta in enumerate(metas):
             self.log(f'Reading title metadata ({i + 1}/{len(metas)})')
+            self.progress({'stage': f'Reading metadata {i + 1}/{len(metas)}', 'total': None})
             folder = self.work / f'meta-{i}'
             self.run(['-x', folder], meta, partition=True)
             cnmts = list(folder.rglob('*.cnmt'))
@@ -214,9 +312,11 @@ class Extractor:
         if not results:
             raise ValueError('No base game or DLC content found.')
         (self.output / 'extraction.json').write_text(json.dumps(results, indent=2), encoding='utf-8')
+        self.progress({'stage': 'Finishing and removing temporary NCAs', 'total': None})
         # Only delete the unique working directory created by this invocation.
         shutil.rmtree(self.work)
         self.log(f'Done. Files are in {self.output}')
+        self.progress({'stage': 'Complete', 'completed': 1, 'total': 1, 'current': '', 'current_bytes': 0})
 
 
 class App(tk.Tk):
@@ -259,8 +359,17 @@ class App(tk.Tk):
         self.start_button.pack(side='right')
         self.cancel_button = ttk.Button(buttons, text='Cancel', command=self.cancelled.set, state='disabled')
         self.cancel_button.pack(side='right', padx=8)
-        self.progress = ttk.Progressbar(outer, mode='indeterminate')
-        self.progress.grid(row=8, column=0, columnspan=3, sticky='ew', pady=(0, 8))
+        progress_frame = ttk.Frame(outer)
+        progress_frame.grid(row=8, column=0, columnspan=3, sticky='ew', pady=(0, 8))
+        progress_frame.columnconfigure(0, weight=1)
+        self.progress = ttk.Progressbar(progress_frame, mode='determinate', maximum=100)
+        self.progress.grid(row=0, column=0, sticky='ew')
+        self.percent = tk.StringVar(value='0.0%')
+        ttk.Label(progress_frame, textvariable=self.percent, width=8, anchor='e').grid(row=0, column=1, padx=(8, 0))
+        self.progress_status = tk.StringVar(value='Ready - percentage is based on completed files in the current stage.')
+        self.current_file = tk.StringVar()
+        ttk.Label(progress_frame, textvariable=self.progress_status, wraplength=740).grid(row=1, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        ttk.Label(progress_frame, textvariable=self.current_file, wraplength=740).grid(row=2, column=0, columnspan=2, sticky='w')
         self.log_box = tk.Text(outer, height=10, wrap='word', state='disabled', font=('Consolas', 10))
         self.log_box.grid(row=9, column=0, columnspan=3, sticky='nsew')
         outer.rowconfigure(9, weight=1)
@@ -316,10 +425,15 @@ class App(tk.Tk):
         self.cancelled.clear()
         self.start_button.configure(state='disabled')
         self.cancel_button.configure(state='normal')
+        self.progress.configure(mode='indeterminate', value=0)
+        self.percent.set('...')
+        self.progress_status.set('Preparing extraction...')
+        self.current_file.set('')
         self.progress.start()
 
         def worker():
-            extractor = Extractor(tool, keys, output, lambda text: self.messages.put(('log', text)), self.cancelled)
+            extractor = Extractor(tool, keys, output, lambda text: self.messages.put(('log', text)), self.cancelled,
+                                  lambda event: self.messages.put(('progress', event)))
             try:
                 extractor.extract(paths)
             except Exception as error:
@@ -335,6 +449,9 @@ class App(tk.Tk):
         try:
             while True:
                 kind, text = self.messages.get_nowait()
+                if kind == 'progress':
+                    self.show_progress(text)
+                    continue
                 self.log_box.configure(state='normal')
                 self.log_box.insert('end', text + '\n')
                 self.log_box.see('end')
@@ -345,12 +462,35 @@ class App(tk.Tk):
                     self.start_button.configure(state='normal')
                     self.cancel_button.configure(state='disabled')
                     if kind == 'error':
+                        self.progress_status.set('Cancelled' if self.cancelled.is_set() else 'Extraction stopped')
                         messagebox.showerror('Extraction stopped', text)
                     else:
                         messagebox.showinfo('Extraction complete', f'RomFS / ExeFS extraction complete.\n\n{text}')
         except queue.Empty:
             pass
         self.after(100, self.poll)
+
+    def show_progress(self, event):
+        total = event.get('total')
+        if total is None:
+            if str(self.progress['mode']) != 'indeterminate':
+                self.progress.configure(mode='indeterminate', value=0)
+                self.progress.start()
+            self.percent.set('...')
+            self.progress_status.set(event['stage'])
+            self.current_file.set('')
+            return
+        self.progress.stop()
+        completed = event.get('completed', 0)
+        percentage = 100 * completed / total if total else 0
+        # Round down so a pending final file never displays a rounded 100%.
+        percentage = int(percentage * 10) / 10
+        self.progress.configure(mode='determinate', value=percentage)
+        self.percent.set(f'{percentage:.1f}%')
+        self.progress_status.set(f"{event['stage']} - {completed:,}/{total:,} files completed")
+        current = event.get('current', '')
+        amount = event.get('current_bytes', 0) / (1024 ** 2)
+        self.current_file.set(f'Writing {current} ({amount:,.1f} MiB written)' if current else '')
 
     def close(self):
         if self.running:
@@ -368,6 +508,12 @@ if __name__ == '__main__':
             app.withdraw()
             app.update()
             report = {'gui_started': True, 'nstool_detected': bool(app.tool.get())}
+            app.show_progress({'stage': 'RomFS', 'completed': 1, 'total': 4,
+                               'current': 'example.bin', 'current_bytes': 1048576})
+            app.update()
+            report['percentage_display'] = app.percent.get()
+            if app.percent.get() != '25.0%':
+                raise RuntimeError('Packaged progress display did not update.')
             app.credits()
             app.update()
             license_root = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
