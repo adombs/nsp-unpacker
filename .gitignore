@@ -1,0 +1,17 @@
+__pycache__/
+.build-venv/
+build/
+dist/
+*.keys
+*.tik
+*.cert
+*.nsp
+*.nsz
+*.xci
+*.nca
+*.romfs
+*.exefs
+romfs/
+exefs/
+DLC/
+_nsp_work_*/
