@@ -20,6 +20,7 @@ from dataclasses import dataclass
 DEFAULT_TOOL = Path.home() / 'Documents/Desktop Folders/Tools/Nintendo Switch Tools/nstool-v1.9.2-win_x64/nstool.exe'
 NSTOOL_CREDIT = 'NSTool by Jack (jakcron) | MIT License'
 APP_NAME = 'NSP Unpacker'
+APP_VERSION = '1.0.0'
 
 
 @dataclass
@@ -322,7 +323,7 @@ class Extractor:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_NAME)
+        self.title(f'{APP_NAME} {APP_VERSION}')
         self.geometry('820x690')
         self.minsize(680, 560)
         self.messages: queue.Queue = queue.Queue()
@@ -393,7 +394,7 @@ class App(tk.Tk):
         box.configure(yscrollcommand=scroll.set)
         scroll.pack(side='right', fill='y')
         box.pack(fill='both', expand=True)
-        box.insert('end', 'NSP Unpacker\nCopyright (c) 2026 adombs\nLicensed under the MIT License.\n\n'
+        box.insert('end', f'NSP Unpacker {APP_VERSION}\nCopyright (c) 2026 adombs\nLicensed under the MIT License.\n\n'
                    'Extraction powered by Nintendo Switch Tool (NSTool).\n'
                    'Original author: Jack (jakcron)\nhttps://github.com/jakcron/nstool\n\n'
                    'This application provides a GUI and automation around the separate NSTool executable.\n'
@@ -507,7 +508,7 @@ if __name__ == '__main__':
             app = App()
             app.withdraw()
             app.update()
-            report = {'gui_started': True, 'nstool_detected': bool(app.tool.get())}
+            report = {'gui_started': True, 'nstool_detected': bool(app.tool.get()), 'version': APP_VERSION}
             app.show_progress({'stage': 'RomFS', 'completed': 1, 'total': 4,
                                'current': 'example.bin', 'current_bytes': 1048576})
             app.update()
